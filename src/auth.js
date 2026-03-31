@@ -117,6 +117,7 @@ function decryptCookie() {
 }
 
 function extractToken() {
+  // Slack desktop sessions may appear as either xoxc-... or mxoxc-... tokens.
   const files = readdirSync(LEVELDB_DIR).filter(
     (f) => f.endsWith(".ldb") || f.endsWith(".log")
   );
@@ -129,7 +130,7 @@ function extractToken() {
       const content = raw.toString("latin1");
 
       // Method 1: direct regex (works for uncompressed entries)
-      for (const m of content.matchAll(/xoxc-[a-zA-Z0-9_-]{20,}/g)) {
+      for (const m of content.matchAll(/m?xoxc-[a-zA-Z0-9_-]{20,}/g)) {
         tokens.add(m[0]);
       }
 
@@ -148,18 +149,21 @@ path = ${JSON.stringify(LEVELDB_DIR)}
 for f in os.listdir(path):
     if not (f.endswith(".ldb") or f.endswith(".log")): continue
     data = open(os.path.join(path, f), "rb").read()
-    # Find all xoxc- positions and extract by reading the hex tail
+    # Find all xoxc-/mxoxc- positions and extract by reading the hex tail
     pos = 0
     while True:
-        idx = data.find(b"xoxc-", pos)
-        if idx < 0: break
-        pos = idx + 5
-        chunk = data[idx:idx+200]
+        idx1 = data.find(b"xoxc-", pos)
+        idx2 = data.find(b"mxoxc-", pos)
+        cands = [i for i in [idx1, idx2] if i >= 0]
+        if not cands: break
+        idx = min(cands)
+        pos = idx + 6
+        chunk = data[idx:idx+220]
         # Find the 64-char hex tail
         text = chunk.decode("latin1")
         hm = re.search(r'[a-f0-9]{64}', text)
         if not hm: continue
-        # Get all bytes from xoxc- to end of hex tail
+        # Get all bytes from xoxc-/mxoxc- to end of hex tail
         end = text.index(hm.group()) + 64
         raw = chunk[:end]
         # Keep only printable token chars
@@ -170,13 +174,13 @@ for f in os.listdir(path):
 `], { encoding: "utf-8", timeout: 5000 });
     if (pyResult.stdout) {
       for (const line of pyResult.stdout.trim().split("\n")) {
-        if (line.startsWith("xoxc-")) tokens.add(line);
+        if (line.startsWith("xoxc-") || line.startsWith("mxoxc-")) tokens.add(line);
       }
     }
   } catch {}
 
   if (tokens.size === 0) {
-    throw new Error("No xoxc- token found. Is Slack running?");
+    throw new Error("No xoxc-/mxoxc- token found. Is Slack running?");
   }
 
   // Return all candidates sorted by length desc; caller will validate
@@ -202,17 +206,20 @@ function saveTokenCache(token) {
 }
 
 function validateToken(token, cookie) {
-  try {
-    const result = spawnSync("curl", [
-      "-s", "https://slack.com/api/auth.test",
-      "-H", `Authorization: Bearer ${token}`,
-      "-b", `d=${cookie}`,
-    ], { encoding: "utf-8", timeout: 10000 });
-    const data = JSON.parse(result.stdout);
-    return data.ok;
-  } catch {
-    return false;
+  const candidates = [token];
+  if (token.startsWith("mxoxc-")) candidates.push(token.slice(1));
+  for (const candidate of candidates) {
+    try {
+      const result = spawnSync("curl", [
+        "-s", "https://slack.com/api/auth.test",
+        "-H", `Authorization: Bearer ${candidate}`,
+        "-b", `d=${cookie}`,
+      ], { encoding: "utf-8", timeout: 10000 });
+      const data = JSON.parse(result.stdout);
+      if (data.ok) return candidate;
+    } catch {}
   }
+  return null;
 }
 
 export function getCredentials(forceRefresh = false) {
@@ -223,8 +230,9 @@ export function getCredentials(forceRefresh = false) {
   // Try cached token first (fastest path)
   if (!forceRefresh) {
     const cache = loadTokenCache();
-    if (cache?.token && validateToken(cache.token, cookie)) {
-      cachedCreds = { token: cache.token, cookie };
+    const validCached = cache?.token ? validateToken(cache.token, cookie) : null;
+    if (validCached) {
+      cachedCreds = { token: validCached, cookie };
       return cachedCreds;
     }
   }
@@ -234,9 +242,10 @@ export function getCredentials(forceRefresh = false) {
 
   // Validate each candidate
   for (const token of candidates) {
-    if (validateToken(token, cookie)) {
-      saveTokenCache(token);
-      cachedCreds = { token, cookie };
+    const validToken = validateToken(token, cookie);
+    if (validToken) {
+      saveTokenCache(validToken);
+      cachedCreds = { token: validToken, cookie };
       return cachedCreds;
     }
   }
