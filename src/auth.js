@@ -1,18 +1,20 @@
 /**
  * Slack auth — extracts session credentials from the Slack desktop app on macOS.
  *
- * 1. Keychain → "Slack Safe Storage" password
- * 2. Cookies SQLite → encrypted `d` cookie → AES-128-CBC decrypt
- * 3. LevelDB files → `xoxc-` token (string scan)
+ * Modern Slack desktop sessions require more than a stale xoxc token from LevelDB.
+ * This implementation:
+ * 1. Reads and decrypts Slack cookies from the desktop app (d/x/b)
+ * 2. Finds a real workspace host and team/channel context from local cache
+ * 3. Requests the workspace root with the d cookie to obtain a fresh xoxc token
+ * 4. Validates the xoxc token with auth.test
  */
 
 import { execSync, spawnSync } from "child_process";
-import { readFileSync, readdirSync, copyFileSync, unlinkSync, writeFileSync } from "fs";
-import { join } from "path";
+import { readFileSync, readdirSync, copyFileSync, unlinkSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import fs from "fs";
+import path, { join } from "path";
 import { homedir, tmpdir } from "os";
 import { pbkdf2Sync } from "crypto";
-
-import { existsSync, mkdirSync } from "fs";
 
 const SLACK_DIR_DIRECT = join(homedir(), "Library", "Application Support", "Slack");
 const SLACK_DIR_APPSTORE = join(
@@ -35,15 +37,24 @@ function resolveSlackDir() {
 }
 
 const SLACK_DIR = resolveSlackDir();
-const LEVELDB_DIR = join(SLACK_DIR, "Local Storage", "leveldb");
 const COOKIES_DB = join(SLACK_DIR, "Cookies");
 const CACHE_DIR = join(homedir(), ".local", "slk");
 const TOKEN_CACHE = join(CACHE_DIR, "token-cache.json");
 
 let cachedCreds = null;
 
+function walk(dir) {
+  const out = [];
+  if (!existsSync(dir)) return out;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...walk(p));
+    else out.push(p);
+  }
+  return out;
+}
+
 function getKeychainKey() {
-  // Mac App Store Slack uses account "Slack App Store Key", direct download uses "Slack" or "Slack Key"
   const accounts = SLACK_DIR === SLACK_DIR_APPSTORE
     ? ["Slack App Store Key", "Slack Key", "Slack"]
     : ["Slack Key", "Slack", "Slack App Store Key"];
@@ -63,20 +74,18 @@ function getKeychainKey() {
   process.exit(1);
 }
 
-function decryptCookie() {
+function decryptCookieValue(name) {
   const tmpDb = join(tmpdir(), `slk_cookies_${Date.now()}.db`);
   copyFileSync(COOKIES_DB, tmpDb);
 
   try {
     const hex = execSync(
-      `sqlite3 "${tmpDb}" "SELECT hex(encrypted_value) FROM cookies WHERE name='d' AND host_key='.slack.com' LIMIT 1;"`,
+      `sqlite3 "${tmpDb}" "SELECT hex(encrypted_value) FROM cookies WHERE name='${name}' AND host_key='.slack.com' LIMIT 1;"`,
       { encoding: "utf-8" }
     ).trim();
 
-    if (!hex) throw new Error("No 'd' cookie found in Slack cookie store");
-
+    if (!hex) throw new Error(`No '${name}' cookie found in Slack cookie store`);
     const encrypted = Buffer.from(hex, "hex");
-
     if (encrypted.subarray(0, 3).toString() !== "v10") {
       throw new Error("Unknown cookie encryption format");
     }
@@ -84,109 +93,107 @@ function decryptCookie() {
     const data = encrypted.subarray(3);
     const aesKey = pbkdf2Sync(getKeychainKey(), "saltysalt", 1003, 16, "sha1");
     const iv = Buffer.alloc(16, " ");
-
-    // Decrypt via openssl using spawnSync for clean binary output
     const tmpEnc = join(tmpdir(), `slk_enc_${Date.now()}.bin`);
     writeFileSync(tmpEnc, data);
-
     const result = spawnSync("openssl", [
       "enc", "-aes-128-cbc", "-d", "-nopad",
       "-K", aesKey.toString("hex"),
       "-iv", iv.toString("hex"),
       "-in", tmpEnc,
     ]);
-    const decrypted = result.stdout;
-
     unlinkSync(tmpEnc);
 
-    if (!decrypted || decrypted.length === 0) {
-      throw new Error("Cookie decryption failed");
-    }
-
-    // Remove PKCS7 padding
+    const decrypted = result.stdout;
+    if (!decrypted || decrypted.length === 0) throw new Error("Cookie decryption failed");
     const padLen = decrypted[decrypted.length - 1];
     const unpadded = padLen <= 16 ? decrypted.subarray(0, -padLen) : decrypted;
-    const text = unpadded.toString("utf-8");
-
-    const idx = text.indexOf("xoxd-");
-    if (idx < 0) throw new Error("No xoxd- found in decrypted cookie");
-    return text.substring(idx);
+    return unpadded.toString("utf-8");
   } finally {
     try { unlinkSync(tmpDb); } catch {}
   }
 }
 
-function extractToken() {
-  // Slack desktop sessions may appear as either xoxc-... or mxoxc-... tokens.
-  const files = readdirSync(LEVELDB_DIR).filter(
-    (f) => f.endsWith(".ldb") || f.endsWith(".log")
-  );
-
-  const tokens = new Set();
-
-  for (const file of files) {
-    try {
-      const raw = readFileSync(join(LEVELDB_DIR, file));
-      const content = raw.toString("latin1");
-
-      // Method 1: direct regex (works for uncompressed entries)
-      for (const m of content.matchAll(/m?xoxc-[a-zA-Z0-9_-]{20,}/g)) {
-        tokens.add(m[0]);
-      }
-
-      // Method 2: Snappy-compressed LevelDB blocks mangle tokens.
-      // Use Python to properly decompress and extract from the JSON structure.
-      // Skip here — handled in extractTokenPython() below.
-    } catch {}
+function extractCookie(name, text) {
+  if (name === "d") {
+    const idx = text.indexOf("xoxd-");
+    if (idx < 0) throw new Error("No xoxd- found in decrypted d cookie");
+    return text.substring(idx);
   }
+  const m = text.match(/([a-f0-9]{32}(?:\.\d+)?)/i);
+  if (!m) throw new Error(`Could not parse '${name}' cookie value`);
+  return m[1];
+}
 
-  // Method 2: Use Python to extract tokens from Snappy-compressed LevelDB
-  // Python's regex on binary-stripped data handles compression artifacts better
-  try {
-    const pyResult = spawnSync("python3", ["-c", `
-import os, re
-path = ${JSON.stringify(LEVELDB_DIR)}
-for f in os.listdir(path):
-    if not (f.endswith(".ldb") or f.endswith(".log")): continue
-    data = open(os.path.join(path, f), "rb").read()
-    # Find all xoxc-/mxoxc- positions and extract by reading the hex tail
-    pos = 0
-    while True:
-        idx1 = data.find(b"xoxc-", pos)
-        idx2 = data.find(b"mxoxc-", pos)
-        cands = [i for i in [idx1, idx2] if i >= 0]
-        if not cands: break
-        idx = min(cands)
-        pos = idx + 6
-        chunk = data[idx:idx+220]
-        # Find the 64-char hex tail
-        text = chunk.decode("latin1")
-        hm = re.search(r'[a-f0-9]{64}', text)
-        if not hm: continue
-        # Get all bytes from xoxc-/mxoxc- to end of hex tail
-        end = text.index(hm.group()) + 64
-        raw = chunk[:end]
-        # Keep only printable token chars
-        clean = bytes(b for b in raw if chr(b) in '0123456789abcdef-xoc').decode()
-        # Validate structure
-        if re.match(r'^xoxc-\\d+-\\d+-\\d+-[a-f0-9]{64}$', clean):
-            print(clean)
-`], { encoding: "utf-8", timeout: 5000 });
-    if (pyResult.stdout) {
-      for (const line of pyResult.stdout.trim().split("\n")) {
-        if (line.startsWith("xoxc-") || line.startsWith("mxoxc-")) tokens.add(line);
-      }
+function decryptCookie() {
+  return extractCookie("d", decryptCookieValue("d"));
+}
+
+function decryptBindingCookies() {
+  return {
+    d: extractCookie("d", decryptCookieValue("d")),
+    x: extractCookie("x", decryptCookieValue("x")),
+    b: extractCookie("b", decryptCookieValue("b")),
+  };
+}
+
+function findWorkspaceContext() {
+  const searchDirs = [
+    join(SLACK_DIR, "Cache", "Cache_Data"),
+    join(SLACK_DIR, "Service Worker", "CacheStorage"),
+    join(SLACK_DIR, "Local Storage", "leveldb"),
+    join(SLACK_DIR, "Session Storage"),
+  ];
+
+  let fallbackTeam = null;
+  let fallbackChannel = null;
+
+  for (const dir of searchDirs) {
+    if (!existsSync(dir)) continue;
+    for (const file of walk(dir)) {
+      try {
+        const buf = fs.readFileSync(file);
+        const content = buf.toString("utf-8");
+        const m = content.match(/app\.slack\.com\/client\/([A-Z0-9]+)\/([A-Z0-9]+)/);
+        if (m) {
+          fallbackTeam = m[1];
+          fallbackChannel = m[2];
+          return { teamId: fallbackTeam, channelId: fallbackChannel };
+        }
+      } catch {}
     }
-  } catch {}
-
-  if (tokens.size === 0) {
-    throw new Error("No xoxc-/mxoxc- token found. Is Slack running?");
   }
 
-  // Return all candidates sorted by length desc; caller will validate
-  return [...tokens]
-    .filter((t) => t.length > 50) // filter truncated tokens
-    .sort((a, b) => b.length - a.length);
+  if (fallbackTeam) return { teamId: fallbackTeam, channelId: fallbackChannel };
+  throw new Error("Could not determine Slack team/channel context from local cache");
+}
+
+function findWorkspaceHost(cookies, context) {
+  const url = `https://app.slack.com/client/${context.teamId}/${context.channelId}`;
+  const result = spawnSync("curl", [
+    "-sL",
+    "-H", `Cookie: d=${cookies.d}; x=${cookies.x}; b=${cookies.b}`,
+    url,
+  ], { encoding: "utf-8", timeout: 20000 });
+
+  const text = result.stdout || "";
+  const matches = [...text.matchAll(/https:\/\/([a-zA-Z0-9-]+)\.slack\.com/g)].map(m => `${m[1]}.slack.com`);
+  const host = matches.find(h => h !== "app.slack.com");
+  if (!host) throw new Error("Could not determine Slack workspace host from app client bootstrap");
+  return host;
+}
+
+function fetchTokenFromWorkspace(cookies, host) {
+  const result = spawnSync("curl", [
+    "-sL",
+    "-H", `Cookie: d=${cookies.d}`,
+    `https://${host}/`,
+  ], { encoding: "utf-8", timeout: 20000 });
+  const text = result.stdout || "";
+  const tokens = [...text.matchAll(/xoxc-[a-zA-Z0-9-]{40,}/g)].map(m => m[0]);
+  if (!tokens.length) {
+    throw new Error(`No xoxc token found from workspace bootstrap (${host})`);
+  }
+  return tokens[0];
 }
 
 function loadTokenCache() {
@@ -198,60 +205,51 @@ function loadTokenCache() {
   return null;
 }
 
-function saveTokenCache(token) {
+function saveTokenCache(token, host) {
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
-    writeFileSync(TOKEN_CACHE, JSON.stringify({ token, ts: Date.now() }));
+    writeFileSync(TOKEN_CACHE, JSON.stringify({ token, host, ts: Date.now() }));
   } catch {}
 }
 
 function validateToken(token, cookie) {
-  const candidates = [token];
-  if (token.startsWith("mxoxc-")) candidates.push(token.slice(1));
-  for (const candidate of candidates) {
-    try {
-      const result = spawnSync("curl", [
-        "-s", "https://slack.com/api/auth.test",
-        "-H", `Authorization: Bearer ${candidate}`,
-        "-b", `d=${cookie}`,
-      ], { encoding: "utf-8", timeout: 10000 });
-      const data = JSON.parse(result.stdout);
-      if (data.ok) return candidate;
-    } catch {}
+  try {
+    const result = spawnSync("curl", [
+      "-s", "https://slack.com/api/auth.test",
+      "-H", `Authorization: Bearer ${token}`,
+      "-b", `d=${cookie}`,
+    ], { encoding: "utf-8", timeout: 10000 });
+    const data = JSON.parse(result.stdout || "{}");
+    return data.ok ? token : null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 export function getCredentials(forceRefresh = false) {
   if (cachedCreds && !forceRefresh) return cachedCreds;
 
-  const cookie = decryptCookie();
+  const cookies = decryptBindingCookies();
 
-  // Try cached token first (fastest path)
   if (!forceRefresh) {
     const cache = loadTokenCache();
-    const validCached = cache?.token ? validateToken(cache.token, cookie) : null;
+    const validCached = cache?.token ? validateToken(cache.token, cookies.d) : null;
     if (validCached) {
-      cachedCreds = { token: validCached, cookie };
+      cachedCreds = { token: validCached, cookie: cookies.d, host: cache.host || null };
       return cachedCreds;
     }
   }
 
-  // Extract fresh tokens from LevelDB
-  const candidates = extractToken();
-
-  // Validate each candidate
-  for (const token of candidates) {
-    const validToken = validateToken(token, cookie);
-    if (validToken) {
-      saveTokenCache(validToken);
-      cachedCreds = { token: validToken, cookie };
-      return cachedCreds;
-    }
+  const context = findWorkspaceContext();
+  const host = findWorkspaceHost(cookies, context);
+  const token = fetchTokenFromWorkspace(cookies, host);
+  const validToken = validateToken(token, cookies.d);
+  if (!validToken) {
+    throw new Error("Failed to obtain a valid Slack session token from workspace bootstrap");
   }
 
-  // Fallback: return first candidate
-  cachedCreds = { token: candidates[0], cookie };
+  saveTokenCache(validToken, host);
+  cachedCreds = { token: validToken, cookie: cookies.d, host };
   return cachedCreds;
 }
 
