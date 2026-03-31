@@ -3,7 +3,7 @@
  *
  * Modern Slack desktop sessions require more than a stale xoxc token from LevelDB.
  * This implementation:
- * 1. Reads and decrypts Slack cookies from the desktop app (d/x/b)
+ * 1. Reads and decrypts Slack cookies from the desktop app (d, and optionally x/b)
  * 2. Finds a real workspace host and team/channel context from local cache
  * 3. Requests the workspace root with the d cookie to obtain a fresh xoxc token
  * 4. Validates the xoxc token with auth.test
@@ -12,7 +12,7 @@
 import { execSync, spawnSync } from "child_process";
 import { readFileSync, readdirSync, copyFileSync, unlinkSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import fs from "fs";
-import path, { join } from "path";
+import { join } from "path";
 import { homedir, tmpdir } from "os";
 import { pbkdf2Sync } from "crypto";
 
@@ -124,19 +124,21 @@ function extractCookie(name, text) {
   return m[1];
 }
 
-function decryptCookie() {
-  return extractCookie("d", decryptCookieValue("d"));
-}
-
 function decryptBindingCookies() {
-  return {
+  const cookies = {
     d: extractCookie("d", decryptCookieValue("d")),
-    x: extractCookie("x", decryptCookieValue("x")),
-    b: extractCookie("b", decryptCookieValue("b")),
   };
+  for (const name of ["x", "b"]) {
+    try {
+      cookies[name] = extractCookie(name, decryptCookieValue(name));
+    } catch {
+      // optional binding cookie absent in some sessions
+    }
+  }
+  return cookies;
 }
 
-function findWorkspaceContext() {
+function findWorkspaceContexts() {
   const searchDirs = [
     join(SLACK_DIR, "Cache", "Cache_Data"),
     join(SLACK_DIR, "Service Worker", "CacheStorage"),
@@ -144,39 +146,59 @@ function findWorkspaceContext() {
     join(SLACK_DIR, "Session Storage"),
   ];
 
-  let fallbackTeam = null;
-  let fallbackChannel = null;
-
+  const candidates = [];
+  const seen = new Set();
   for (const dir of searchDirs) {
     if (!existsSync(dir)) continue;
     for (const file of walk(dir)) {
       try {
         const buf = fs.readFileSync(file);
         const content = buf.toString("utf-8");
-        const m = content.match(/app\.slack\.com\/client\/([A-Z0-9]+)\/([A-Z0-9]+)/);
-        if (m) {
-          fallbackTeam = m[1];
-          fallbackChannel = m[2];
-          return { teamId: fallbackTeam, channelId: fallbackChannel };
+        for (const m of content.matchAll(/app\.slack\.com\/client\/([A-Z0-9]+)\/([A-Z0-9]+)/g)) {
+          const ctx = { teamId: m[1], channelId: m[2] };
+          const key = `${ctx.teamId}:${ctx.channelId}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            candidates.push(ctx);
+          }
         }
       } catch {}
     }
   }
-
-  if (fallbackTeam) return { teamId: fallbackTeam, channelId: fallbackChannel };
-  throw new Error("Could not determine Slack team/channel context from local cache");
+  return candidates;
 }
 
-function findWorkspaceHost(cookies, context) {
+function chooseWorkspaceContext(preferred = {}) {
+  const contexts = findWorkspaceContexts();
+  if (!contexts.length) {
+    throw new Error("Could not determine Slack team/channel context from local cache");
+  }
+  if (preferred.teamId) {
+    const exact = contexts.find(c => c.teamId === preferred.teamId);
+    if (exact) return exact;
+  }
+  return contexts[0];
+}
+
+function cookieHeader(cookies) {
+  const parts = [`d=${cookies.d}`];
+  if (cookies.x) parts.push(`x=${cookies.x}`);
+  if (cookies.b) parts.push(`b=${cookies.b}`);
+  return parts.join('; ');
+}
+
+function findWorkspaceHost(cookies, context, preferred = {}) {
   const url = `https://app.slack.com/client/${context.teamId}/${context.channelId}`;
   const result = spawnSync("curl", [
     "-sL",
-    "-H", `Cookie: d=${cookies.d}; x=${cookies.x}; b=${cookies.b}`,
+    "-H", `Cookie: ${cookieHeader(cookies)}`,
     url,
   ], { encoding: "utf-8", timeout: 20000 });
 
   const text = result.stdout || "";
   const matches = [...text.matchAll(/https:\/\/([a-zA-Z0-9-]+)\.slack\.com/g)].map(m => `${m[1]}.slack.com`);
+  const wantedHost = preferred.hostHint ? (preferred.hostHint.endsWith('.slack.com') ? preferred.hostHint : `${preferred.hostHint}.slack.com`) : null;
+  if (wantedHost && matches.includes(wantedHost)) return wantedHost;
   const host = matches.find(h => h !== "app.slack.com");
   if (!host) throw new Error("Could not determine Slack workspace host from app client bootstrap");
   return host;
@@ -205,10 +227,10 @@ function loadTokenCache() {
   return null;
 }
 
-function saveTokenCache(token, host) {
+function saveTokenCache(token, host, teamId = null) {
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
-    writeFileSync(TOKEN_CACHE, JSON.stringify({ token, host, ts: Date.now() }));
+    writeFileSync(TOKEN_CACHE, JSON.stringify({ token, host, teamId, ts: Date.now() }));
   } catch {}
 }
 
@@ -220,13 +242,13 @@ function validateToken(token, cookie) {
       "-b", `d=${cookie}`,
     ], { encoding: "utf-8", timeout: 10000 });
     const data = JSON.parse(result.stdout || "{}");
-    return data.ok ? token : null;
+    return data.ok ? data : null;
   } catch {
     return null;
   }
 }
 
-export function getCredentials(forceRefresh = false) {
+export function getCredentials(forceRefresh = false, preferred = {}) {
   if (cachedCreds && !forceRefresh) return cachedCreds;
 
   const cookies = decryptBindingCookies();
@@ -234,26 +256,28 @@ export function getCredentials(forceRefresh = false) {
   if (!forceRefresh) {
     const cache = loadTokenCache();
     const validCached = cache?.token ? validateToken(cache.token, cookies.d) : null;
-    if (validCached) {
-      cachedCreds = { token: validCached, cookie: cookies.d, host: cache.host || null };
+    const hostMatches = !preferred.hostHint || !cache?.host || cache.host === preferred.hostHint || cache.host === `${preferred.hostHint}.slack.com`;
+    const teamMatches = !preferred.teamId || !cache?.teamId || cache.teamId === preferred.teamId;
+    if (validCached && hostMatches && teamMatches) {
+      cachedCreds = { token: cache.token, cookie: cookies.d, host: cache.host || null, teamId: validCached.team_id || cache.teamId || null };
       return cachedCreds;
     }
   }
 
-  const context = findWorkspaceContext();
-  const host = findWorkspaceHost(cookies, context);
+  const context = chooseWorkspaceContext(preferred);
+  const host = findWorkspaceHost(cookies, context, preferred);
   const token = fetchTokenFromWorkspace(cookies, host);
-  const validToken = validateToken(token, cookies.d);
-  if (!validToken) {
+  const validated = validateToken(token, cookies.d);
+  if (!validated) {
     throw new Error("Failed to obtain a valid Slack session token from workspace bootstrap");
   }
 
-  saveTokenCache(validToken, host);
-  cachedCreds = { token: validToken, cookie: cookies.d, host };
+  saveTokenCache(token, host, validated.team_id || context.teamId || null);
+  cachedCreds = { token, cookie: cookies.d, host, teamId: validated.team_id || context.teamId || null };
   return cachedCreds;
 }
 
-export function refresh() {
+export function refresh(preferred = {}) {
   cachedCreds = null;
-  return getCredentials(true);
+  return getCredentials(true, preferred);
 }

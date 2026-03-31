@@ -6,6 +6,7 @@
 
 import * as cmd from "../src/commands.js";
 import * as drafts from "../src/drafts.js";
+import { setAuthPreference } from "../src/api.js";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -13,6 +14,14 @@ const command = args[0];
 const supportsEmoji = !process.env.NO_EMOJI && !process.argv.includes("--no-emoji");
 const showTs = process.argv.includes("--ts");
 const e = (emoji, fallback = "") => supportsEmoji ? emoji + " " : fallback;
+
+const workspaceIdx = process.argv.indexOf("--workspace");
+const teamIdx = process.argv.indexOf("--team");
+const authPreference = {
+  hostHint: workspaceIdx > -1 ? process.argv[workspaceIdx + 1] : undefined,
+  teamId: teamIdx > -1 ? process.argv[teamIdx + 1] : undefined,
+};
+setAuthPreference(authPreference);
 
 const HELP = `${e("💬")}slk — Slack CLI for macOS (auto-auth from Slack desktop app)
 
@@ -44,12 +53,16 @@ Settings:
   --threads                               Auto-expand threads when reading
   --from YYYY-MM-DD                       Read messages from this date
   --to YYYY-MM-DD                         Read messages until this date
+  --workspace <subdomain>                 Prefer a specific workspace (e.g. dax27slack)
+  --team <TEAM_ID>                        Prefer a specific team id (e.g. T09FUSSUW68)
   --no-emoji                              Disable emoji output (or set NO_EMOJI=1)
 
 Channels: name ("general"), ID ("C08A8AQ2AFP"), @username, or user ID ("U...").
 DMs: use @username or user ID to send/read DMs. Aliases shown in parens.
 
 Examples:
+  slk auth --workspace dax27slack         Authenticate against a specific workspace
+  slk channels --team T09FUSSUW68         Use a specific team context
   slk read general 50                     Last 50 messages from #general
   slk read @andrej 100 --threads          Read DM with Andrej, expand all threads
   slk read @nikhil --from 2026-02-01      Read DM from Feb 1st onwards
@@ -96,7 +109,6 @@ async function main() {
         if (toIdx > -1 && args[toIdx + 1]) {
           latest = String(new Date(args[toIdx + 1]).getTime() / 1000);
         }
-        // Find count (first numeric arg after channel)
         let count = 20;
         for (let i = 2; i < args.length; i++) {
           if (/^\d+$/.test(args[i])) { count = parseInt(args[i]); break; }
@@ -180,10 +192,9 @@ async function main() {
           }
           await drafts.draftUser(args[2], args.slice(3).join(" "));
         } else if (sub === "drop") {
-          if (!args[2]) { console.error("Usage: slk draft drop <draft_id>"); process.exit(1); }
+          if (!args[2]) { console.error("Usage: slk draft drop <id>"); process.exit(1); }
           await drafts.dropDraft(args[2]);
         } else {
-          // slk draft <channel> <message>
           if (!sub || !args[2]) {
             console.error("Usage: slk draft <channel> <message>");
             process.exit(1);

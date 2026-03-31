@@ -5,13 +5,18 @@
 import { getCredentials, refresh } from "./auth.js";
 
 const BASE = "https://slack.com/api";
+let authPreference = {};
+
+export function setAuthPreference(pref = {}) {
+  authPreference = pref || {};
+}
 
 /**
  * Make an authenticated Slack API call.
  * Auto-refreshes credentials on invalid_auth (once).
  */
 export async function slackApi(method, params = {}, retried = false) {
-  const { token, cookie } = getCredentials();
+  const { token, cookie } = getCredentials(false, authPreference);
 
   const url = new URL(`${BASE}/${method}`);
 
@@ -60,7 +65,7 @@ export async function slackApi(method, params = {}, retried = false) {
   const data = await res.json();
 
   if (!data.ok && data.error === "invalid_auth" && !retried) {
-    refresh();
+    refresh(authPreference);
     return slackApi(method, params, true);
   }
 
@@ -76,7 +81,7 @@ export async function slackPaginate(method, params = {}, key = "channels") {
 
   do {
     const data = await slackApi(method, { ...params, cursor, limit: params.limit || 200 });
-    if (!data.ok) return data; // return error as-is
+    if (!data.ok) return data;
 
     if (data[key]) results.push(...data[key]);
     cursor = data.response_metadata?.next_cursor;
